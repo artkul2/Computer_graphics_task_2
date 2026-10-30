@@ -89,68 +89,140 @@ public class Rasterization {
 
 
 
-        int weight;
-        int left_edge_x;
+        // Вершины упорядочиваются по возрастанию Y: top (y == minY), middle, bottom (y == maxY).
+        // Это гарантирует корректную растеризацию как для «острого» (верхняя точка),
+        // так и для «перевёрнутого» (нижняя точка) треугольника.
+        int topX = x0, topY = y0; Color topColor = color0;
+        int midX = x1, midY = y1; Color midColor = color1;
+        int botX = x2, botY = y2; Color botColor = color2;
 
-        for(int y = y1; y < y2; y++){
-            int one_edge_x = (y - y0) * (x2 - x0) / (y2 - y0) + x0;
-            int sec_edge_x = (y - y2) * (x1 - x2) / (y1 - y2) + x2;
-            left_edge_x = Math.min(one_edge_x, sec_edge_x);
-            weight = Math.abs(one_edge_x - sec_edge_x) + left_edge_x;
-            for(int x = left_edge_x; x < weight; x++){
-                pixelWriter.setColor(x, y, getColor(x, y, x0, y0, color0, x1, y1, color1, x2, y2, color2));
-            }
+        if (topY > midY) { int tx = topX; topX = midX; midX = tx;
+                           int ty = topY; topY = midY; midY = ty;
+                           Color tc = topColor; topColor = midColor; midColor = tc; }
+        if (midY > botY) { int tx = midX; midX = botX; botX = tx;
+                           int ty = midY; midY = botY; botY = ty;
+                           Color tc = midColor; midColor = botColor; botColor = tc; }
+        if (topY > midY) { int tx = topX; topX = midX; midX = tx;
+                           int ty = topY; topY = midY; midY = ty;
+                           Color tc = topColor; topColor = midColor; midColor = tc; }
+
+        // Обход top -> middle -> bottom должен быть против часовой стрелки в экранных
+        // координатах (Y вниз): тогда edge-функции положительны внутри треугольника.
+        // Если порядок обхода противоположный, разворачиваем его, меняя местами среднюю
+        // и нижнюю вершины (вместе с их цветами). Без этого треугольники с обходом по
+        // часовой стрелке не рисовались вообще («треугольник исчезает»).
+        boolean orientationFlipped = false;
+        double signedArea2 = (double) (midX - topX) * (botY - topY)
+                           - (double) (botX - topX) * (midY - topY);
+        if (signedArea2 < 0) {
+            int tx = midX; midX = botX; botX = tx;
+            int ty = midY; midY = botY; botY = ty;
+            Color tc = midColor; midColor = botColor; botColor = tc;
+            orientationFlipped = true;
         }
 
-        for(int y = y1; y > y0; y--){
-            int one_edge_x = (y - y0) * (x2 - x0) / (y2 - y0) + x0;
-            int sec_edge_x = (y - y0) * (x1 - x0) / (y1 - y0) + x0;
-            left_edge_x = Math.min(one_edge_x, sec_edge_x);
-            weight = Math.abs(one_edge_x - sec_edge_x) + left_edge_x;
-            for(int x = left_edge_x; x < weight; x++){
-                pixelWriter.setColor(x, y, getColor(x, y, x0, y0, color0, x1, y1, color1, x2, y2, color2));
+        // Вырожденный треугольник (все вершины на одной горизонтали) — рисуем горизонтальную линию
+        if (topY == botY) {
+            int lx = Math.min(topX, Math.min(midX, botX));
+            int rx = Math.max(topX, Math.max(midX, botX));
+            for (int x = lx; x <= rx; x++) {
+                pixelWriter.setColor(x, topY, Color.BLACK);
+            }
+            return;
+        }
+
+        final double dTopX = topX, dTopY = topY;
+        final double dMidX = midX, dMidY = midY;
+        final double dBotX = botX, dBotY = botY;
+
+        // Наклонные рёбра: long — от верхней вершины до нижней,
+        // short — ломаная верх -> середина -> низ.
+        final double longSlope  = (dBotX - dTopX) / (dBotY - dTopY);
+        final double upperSlope = (dMidY == dTopY) ? 0 : (dMidX - dTopX) / (dMidY - dTopY);
+        final double lowerSlope = (dBotY == dMidY) ? 0 : (dBotX - dMidX) / (dBotY - dMidY);
+
+        // Последняя закрашиваемая строка: нижняя вершина включается только
+        // если при ней есть горизонтальное ребро (botY == midY)
+        final int lastPaintedY = (botY == midY) ? botY : botY - 1;
+
+        // Эталонное правило растеризации (top-left fill rule): пиксел закрашивается,
+        // если его центр (x+0.5, y+0.5) лежит внутри треугольника, либо на его
+        // «верхне-левом» краю. Обход top -> middle -> bottom всегда ориентирован
+        // против часовой стрелки в экранных координатах (Y вниз), поэтому центры
+        // треугольника дают положительную edge function w = dx*(yc-y1) - dy*(xc-x1).
+        final double eABx = dMidX - dTopX, eABy = dMidY - dTopY; // top -> middle
+        final double eBCx = dBotX - dMidX, eBCy = dBotY - dMidY; // middle -> bottom
+        final double eCAx = dTopX - dBotX, eCAy = dTopY - dBotY; // bottom -> top
+
+        // Барицентрические веса вычисляются напрямую из edge-функций:
+        // вес top = wBC / area2, вес middle = wCA / area2, вес bottom = wAB / area2,
+        // где area2 — удвоенная площадь треугольника (при CCW-обходе > 0).
+        // Это исключает случайные «TRANSPARENT/BLACK», которые давал getColor() при
+        // расхождении спана и теста покрытия, и гарантирует корректный градиент
+        // независимо от порядка обхода вершин.
+        final double area2v = (double) eABy * eCAx - (double) eABx * eCAy; // > 0 после нормализации ориентации
+
+        for (int y = topY; y <= lastPaintedY; y++) {
+            final double yc = y + 0.5;
+
+            double lx = dTopX + (yc - dTopY) * longSlope;              // x ребра long на уровне yc
+            double sx = (yc <= dMidY)                                  // x ломаного short-ребра
+                        ? dTopX + (yc - dTopY) * upperSlope
+                        : dMidX + (yc - dMidY) * lowerSlope;
+
+            int start = (int) Math.ceil(Math.min(lx, sx) - 0.5);
+            int end   = (int) Math.ceil(Math.max(lx, sx) - 0.5);
+
+            // Горизонтальные рёбра всегда принадлежат треугольнику — расширяем спан
+            boolean includeTopEdge    = (y == topY && midY == topY);
+            boolean includeMiddleEdge = (y == midY && midY != topY);
+            boolean includeBottomEdge = (y == botY && botY == midY);
+
+            if (includeMiddleEdge || includeBottomEdge) {
+                start = Math.min(start, Math.min(midX, botX));
+                end   = Math.max(end,   Math.max(midX, botX) + 1);
+            } else if (includeTopEdge) {
+                start = Math.min(start, Math.min(topX, midX));
+                end   = Math.max(end,   Math.max(topX, midX) + 1);
+            }
+
+            for (int x = start; x < end; x++) {
+                final double xc = x + 0.5;
+
+                double wAB = eABx * (yc - dTopY) - eABy * (xc - dTopX);
+                double wBC = eBCx * (yc - dMidY) - eBCy * (xc - dMidX);
+                double wCA = eCAx * (yc - dBotY) - eCAy * (xc - dBotX);
+
+                final double eps = 1e-9;
+                boolean inAB = (wAB > -eps) && (Math.abs(wAB) > eps || isTopLeftEdge(eABx, eABy));
+                boolean inBC = (wBC > -eps) && (Math.abs(wBC) > eps || isTopLeftEdge(eBCx, eBCy));
+                boolean inCA = (wCA > -eps) && (Math.abs(wCA) > eps || isTopLeftEdge(eCAx, eCAy));
+
+                if (!(inAB && inBC && inCA)) continue;
+
+                double wa = Math.max(0, Math.min(1, wBC / area2v)); // вес top
+                double wb = Math.max(0, Math.min(1, wCA / area2v)); // вес middle
+                double wc = Math.max(0, Math.min(1, wAB / area2v)); // вес bottom
+
+                pixelWriter.setColor(x, y, interpolateColor(topColor, midColor, botColor, wa, wb, wc));
             }
         }
     }
 
-    private static Color getColor(final int x, final int y,
-                                  final int x0, final int y0, final Color colorA,
-                                  final int x1, final int y1, final Color colorB,
-                                  final int x2, final int y2, final Color colorC
-    ){
+    // Правило «верхне-левшего» края для edge function с направлением (dx, dy):
+    // такое ребро включает лежащие на нём пикселы, если оно восходящее (dy < 0)
+    // или горизонтальное, направленное вправо (dy == 0 и dx > 0).
+    private static boolean isTopLeftEdge(final double dx, final double dy) {
+        return dy < 0 || (dy == 0 && dx > 0);
+    }
 
-        double det = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
-
-
-        if (Math.abs(det) < 1e-9) {
-            return Color.BLACK;
-        }
-
-        double A = ((y1 - y2) * (x - x2) + (x2 - x1) * (y - y2)) / det;
-        double B = ((y2 - y0) * (x - x2) + (x0 - x2) * (y - y2)) / det;
-        double C = 1.0 - A - B;
-
-        if (A < 0 || B < 0 || C < 0) {
-            return Color.TRANSPARENT;
-        }
-
-        double rA = colorA.getRed() * 255;
-        double gA = colorA.getGreen() * 255;
-        double bA = colorA.getBlue() * 255;
-
-        double rB = colorB.getRed() * 255;
-        double gB = colorB.getGreen() * 255;
-        double bB = colorB.getBlue() * 255;
-
-        double rC = colorC.getRed() * 255;
-        double gC = colorC.getGreen() * 255;
-        double bC = colorC.getBlue() * 255;
-
-        int r = (int) Math.round(A * rA + B * rB + C * rC);
-        int g = (int) Math.round(A * gA + B * gB + C * gC);
-        int b = (int) Math.round(A * bA + B * bB + C * bC);
-
-        return Color.rgb(r, g, b);
+    // Интерполяция цвета по барицентрическим весам вершин (wa + wb + wc == 1).
+    private static Color interpolateColor(final Color a, final Color b, final Color c,
+                                          final double wa, final double wb, final double wc) {
+        int r = (int) Math.round((a.getRed()   * wa + b.getRed()   * wb + c.getRed()   * wc) * 255);
+        int g = (int) Math.round((a.getGreen() * wa + b.getGreen() * wb + c.getGreen() * wc) * 255);
+        int bl= (int) Math.round((a.getBlue()  * wa + b.getBlue()  * wb + c.getBlue()  * wc) * 255);
+        return Color.rgb(r, g, bl);
     }
 
     public static void clear(final GraphicsContext graphicsContext){
